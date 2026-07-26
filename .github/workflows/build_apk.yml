@@ -20,6 +20,21 @@ jobs:
         with:
           channel: 'stable'
 
+      - name: Tự giải nén nếu người dùng chỉ upload file .zip
+        run: |
+          ZIPFILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
+          if [ -n "$ZIPFILE" ]; then
+            echo "Tìm thấy $ZIPFILE, đang giải nén..."
+            mkdir -p /tmp/extracted
+            unzip -o "$ZIPFILE" -d /tmp/extracted
+            INNER_DIR=$(find /tmp/extracted -maxdepth 1 -mindepth 1 -type d | head -n 1)
+            if [ -f "$INNER_DIR/pubspec.yaml" ]; then
+              cp -rn "$INNER_DIR"/. .
+            else
+              cp -rn /tmp/extracted/. .
+            fi
+          fi
+
       - name: Backup code thật (lib/ + pubspec.yaml) trước khi flutter create
         run: |
           mkdir -p /tmp/real_app_backup
