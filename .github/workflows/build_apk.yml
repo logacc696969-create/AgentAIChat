@@ -20,25 +20,28 @@ jobs:
         with:
           channel: 'stable'
 
-      # Project gửi cho người dùng chỉ có lib/ + pubspec.yaml (không có
-      # android/), vì môi trường tạo code ban đầu không có Flutter SDK.
-      # Bước này để CHÍNH GITHUB ACTIONS tự sinh thư mục android/ bằng đúng
-      # phiên bản Flutter/Gradle nó vừa cài — luôn khớp version, không cần
-      # người dùng tự chạy `flutter create` ở máy mình nữa.
+      - name: Backup code thật (lib/ + pubspec.yaml) trước khi flutter create
+        run: |
+          mkdir -p /tmp/real_app_backup
+          cp -r lib /tmp/real_app_backup/lib
+          cp pubspec.yaml /tmp/real_app_backup/pubspec.yaml
+
       - name: Tự sinh thư mục android/ nếu chưa có
         run: |
           if [ ! -d "android" ]; then
             flutter create --org com.example --project-name ai_chat_app --platforms=android .
           fi
 
-      # flutter create mặc định không bật quyền Internet — bắt buộc phải có
-      # để app gọi được API model. Tự thêm nếu chưa có, không cần người
-      # dùng sửa tay AndroidManifest.xml.
+      - name: Phục hồi lại code thật (đè lên app mẫu nếu flutter create có ghi đè)
+        run: |
+          rm -rf lib
+          cp -r /tmp/real_app_backup/lib lib
+          cp /tmp/real_app_backup/pubspec.yaml pubspec.yaml
+
       - name: Tự thêm quyền INTERNET vào AndroidManifest
         run: |
           MANIFEST=android/app/src/main/AndroidManifest.xml
           if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
-            sed -i '0,/<manifest /s//<manifest xmlns:tools="http:\/\/schemas.android.com\/tools" /' "$MANIFEST" 2>/dev/null || true
             sed -i '/<manifest /a\    <uses-permission android:name="android.permission.INTERNET"/>' "$MANIFEST"
           fi
 
