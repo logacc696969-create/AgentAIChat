@@ -20,32 +20,57 @@ jobs:
         with:
           channel: 'stable'
 
+      # Cho phép người dùng CHỈ CẦN upload đúng 1 file .zip lên repo (dễ làm
+      # trên điện thoại, vì mobile không chọn được cả cây thư mục) — bước
+      # này tự tìm và giải nén nó ra trước khi build. Tên file zip có thể
+      # khác nhau nên tự dò bất kỳ file .zip nào ở gốc repo.
       - name: Tự giải nén nếu người dùng chỉ upload file .zip
         run: |
           ZIPFILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
+          NUM_ZIPS=$(find . -maxdepth 1 -name "*.zip" | wc -l)
+          if [ "$NUM_ZIPS" -gt 1 ]; then
+            echo "CẢNH BÁO: có $NUM_ZIPS file .zip ở gốc repo, chỉ dùng file: $ZIPFILE — xoá bớt các file zip thừa để tránh nhầm lẫn."
+          fi
           if [ -n "$ZIPFILE" ]; then
             echo "Tìm thấy $ZIPFILE, đang giải nén..."
             mkdir -p /tmp/extracted
             unzip -o "$ZIPFILE" -d /tmp/extracted
+            # Zip có 1 lớp thư mục ai_chat_app/ bên trong -> đưa nội dung
+            # bên trong nó lên thẳng gốc repo (nơi flutter cần pubspec.yaml).
+            # DÙNG FORCE OVERWRITE (không phải -n) để nội dung trong file
+            # zip LUÔN LUÔN thắng, đè lên bất kỳ file cũ nào đã lỡ nằm sẵn
+            # trong repo từ trước (ví dụ do từng di chuyển file thủ công ở
+            # lần thử trước) — tránh tình trạng build dùng nhầm code cũ dù
+            # đã upload zip mới.
             INNER_DIR=$(find /tmp/extracted -maxdepth 1 -mindepth 1 -type d | head -n 1)
             if [ -f "$INNER_DIR/pubspec.yaml" ]; then
-              cp -rn "$INNER_DIR"/. .
+              cp -rf "$INNER_DIR"/. .
             else
-              cp -rn /tmp/extracted/. .
+              cp -rf /tmp/extracted/. .
             fi
           fi
+          echo "--- pubspec.yaml sẽ dùng để build: ---"
+          cat pubspec.yaml
 
+      # Project gửi cho người dùng chỉ có lib/ + pubspec.yaml (không có
+      # android/), vì môi trường tạo code ban đầu không có Flutter SDK.
+      # Bước dưới đây để CHÍNH GITHUB ACTIONS tự sinh thư mục android/ bằng
+      # đúng phiên bản Flutter/Gradle nó vừa cài.
+      #
+      # QUAN TRỌNG: `flutter create` có thể ghi đè lib/main.dart và
+      # pubspec.yaml bằng app mẫu (app đếm số mặc định) — nên PHẢI backup
+      # code thật trước, và PHỤC HỒI LẠI sau, để đảm bảo APK build ra luôn
+      # là app thật, không phải app mẫu.
       - name: Backup code thật (lib/ + pubspec.yaml) trước khi flutter create
         run: |
           mkdir -p /tmp/real_app_backup
           cp -r lib /tmp/real_app_backup/lib
           cp pubspec.yaml /tmp/real_app_backup/pubspec.yaml
 
-      - name: Tự sinh thư mục android/ nếu chưa có
+      - name: Luôn sinh lại thư mục android/ từ đầu (tránh dùng nhầm bản cũ còn sót trong repo)
         run: |
-          if [ ! -d "android" ]; then
-            flutter create --org com.example --project-name ai_chat_app --platforms=android .
-          fi
+          rm -rf android
+          flutter create --org com.example --project-name agent_ai_chat --platforms=android .
 
       - name: Phục hồi lại code thật (đè lên app mẫu nếu flutter create có ghi đè)
         run: |
@@ -53,6 +78,135 @@ jobs:
           cp -r /tmp/real_app_backup/lib lib
           cp /tmp/real_app_backup/pubspec.yaml pubspec.yaml
 
+      # Đã BỎ webview_cookie_manager (package bỏ hoang, gây lỗi Gradle
+      # "Namespace not specified" không vá được — xem lịch sử build #34/#37
+      # trong HANDOFF.md). Thay vào đó, ghi đè MainActivity.kt (bị sinh lại
+      # từ đầu mỗi lần `flutter create`) để thêm 1 MethodChannel gọi thẳng
+      # android.webkit.CookieManager — có sẵn trong Android SDK, KHÔNG cần
+      # thêm dependency Gradle nào, nên không thể tái diễn lỗi kiểu này nữa.
+      - name: Thêm MethodChannel lấy cookie WebView vào MainActivity.kt
+        run: |
+          MAIN_KT=$(find android/app/src/main/kotlin -name MainActivity.kt | head -n1)
+          if [ -z "$MAIN_KT" ]; then
+            echo "CẢNH BÁO: không tìm thấy MainActivity.kt, bỏ qua bước này."
+          else
+            PACKAGE=$(grep -m1 '^package ' "$MAIN_KT" | sed 's/package //')
+            {
+              echo "package $PACKAGE"
+              echo ''
+              echo 'import android.webkit.CookieManager'
+              echo 'import io.flutter.embedding.android.FlutterActivity'
+              echo 'import io.flutter.embedding.engine.FlutterEngine'
+              echo 'import io.flutter.plugin.common.MethodChannel'
+              echo ''
+              echo 'class MainActivity : FlutterActivity() {'
+              echo '    private val CHANNEL = "agent_ai_chat/cookies"'
+              echo ''
+              echo '    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {'
+              echo '        super.configureFlutterEngine(flutterEngine)'
+              echo '        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->'
+              echo '            if (call.method == "getCookies") {'
+              echo '                val url = call.argument<String>("url")'
+              echo '                val cookie = if (url != null) CookieManager.getInstance().getCookie(url) else null'
+              echo '                result.success(cookie ?: "")'
+              echo '            } else {'
+              echo '                result.notImplemented()'
+              echo '            }'
+              echo '        }'
+              echo '    }'
+              echo '}'
+            } > "$MAIN_KT"
+            echo "--- MainActivity.kt sau khi ghi đè (package=$PACKAGE) ---"
+            cat "$MAIN_KT"
+          fi
+
+      # file_picker (và một số plugin mới khác) đòi compileSdk/targetSdk 36,
+      # trong khi bản Flutter cài ở trên có thể tự sinh android/ với con số
+      # thấp hơn tuỳ thời điểm channel stable — ép cứng lên 36 ngay sau khi
+      # sinh để tránh lặp lại lỗi "Could not find method kotlin()"/
+      # "compileSdk mismatch" đã từng gặp.
+      - name: Ép compileSdk/targetSdk = 36 (yêu cầu của các plugin mới)
+        run: |
+          GRADLE_FILE=android/app/build.gradle.kts
+          if [ -f "$GRADLE_FILE" ]; then
+            sed -i -E 's/compileSdk[[:space:]]*=[[:space:]]*flutter\.compileSdkVersion/compileSdk = 36/' "$GRADLE_FILE"
+            sed -i -E 's/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 36/' "$GRADLE_FILE"
+            sed -i -E 's/targetSdk[[:space:]]*=[[:space:]]*flutter\.targetSdkVersion/targetSdk = 36/' "$GRADLE_FILE"
+            sed -i -E 's/targetSdk[[:space:]]*=[[:space:]]*[0-9]+/targetSdk = 36/' "$GRADLE_FILE"
+            echo "--- android/app/build.gradle.kts sau khi ép compileSdk/targetSdk ---"
+            grep -n "compileSdk\|targetSdk" "$GRADLE_FILE"
+          fi
+
+      # google_mlkit_text_recognition tham chiếu (trong chính code Kotlin đã
+      # biên dịch sẵn của plugin) tới các lớp nhận diện chữ Trung/Nhật/Hàn/
+      # Devanagari, kể cả khi app chỉ dùng Latin — R8 (bước thu gọn code khi
+      # build release) báo lỗi "Missing class" vì các lớp đó không có sẵn
+      # trong classpath (app không khai báo thêm các module ngôn ngữ đó).
+      # Thêm "-dontwarn" để R8 bỏ qua cảnh báo này — an toàn vì app đã bỏ
+      # hẳn lựa chọn OCR các ngôn ngữ đó trong UI (chỉ còn Latin), nên các
+      # đường code đó chắc chắn không bao giờ được gọi tới lúc chạy thật.
+      - name: Ghi proguard-rules.pro (bỏ qua class ML Kit ngôn ngữ không dùng)
+        run: |
+          mkdir -p android/app
+          {
+            echo '# ML Kit text recognition tham chiếu sẵn các lớp ngôn ngữ Trung/Nhật/'
+            echo '# Hàn/Devanagari trong code đã biên dịch, dù app chỉ dùng Latin.'
+            echo '-dontwarn com.google.mlkit.vision.text.chinese.**'
+            echo '-dontwarn com.google.mlkit.vision.text.japanese.**'
+            echo '-dontwarn com.google.mlkit.vision.text.korean.**'
+            echo '-dontwarn com.google.mlkit.vision.text.devanagari.**'
+          } > android/app/proguard-rules.pro
+          echo "--- android/app/proguard-rules.pro ---"
+          cat android/app/proguard-rules.pro
+
+          # Đảm bảo build.gradle.kts THẬT SỰ tham chiếu file này trong buildType
+          # release. Neo vào chính dòng MỞ `getByName("release") {` (không
+          # phải dòng "signingConfig" như lần thử trước) — vì dòng đó CHẮC
+          # CHẮN luôn tồn tại bất kể bên trong release{} có nội dung gì, còn
+          # neo theo "signingConfig" đã từng ÂM THẦM THẤT BẠI (không lỗi,
+          # nhưng cũng không chèn được gì) khi bản Flutter thật không sinh ra
+          # dòng đó — đã tự dựng file giả lập KHÔNG có signingConfig để tái
+          # hiện đúng lỗi này trước khi sửa, xác nhận bằng test thật.
+          GRADLE_FILE=android/app/build.gradle.kts
+          if [ -f "$GRADLE_FILE" ] && ! grep -q "proguard-rules.pro" "$GRADLE_FILE"; then
+            echo "build.gradle.kts chưa có proguardFiles — tự thêm vào buildTypes.release"
+            sed -i -E '/getByName\("release"\)[[:space:]]*\{/a\            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")' "$GRADLE_FILE"
+          fi
+          # Fallback: 1 số bản Flutter dùng cú pháp Kotlin DSL rút gọn
+          # "release { }" (không có "getByName(...)") — thử thêm nếu cách
+          # trên vẫn chưa chèn được gì.
+          if [ -f "$GRADLE_FILE" ] && ! grep -q "proguard-rules.pro" "$GRADLE_FILE"; then
+            echo "Vẫn chưa có — thử neo vào cú pháp rút gọn 'release {'"
+            sed -i -E '0,/[^a-zA-Z]release[[:space:]]*\{/{s/([^a-zA-Z]release[[:space:]]*\{)/\1\n            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")/}' "$GRADLE_FILE"
+          fi
+          if ! grep -q "proguard-rules.pro" "$GRADLE_FILE"; then
+            echo "!!! CẢNH BÁO: không chèn được proguardFiles bằng cả 2 cách — xem toàn bộ file bên dưới để tự thêm tay nếu cần !!!"
+          fi
+          echo "--- TOÀN BỘ android/app/build.gradle.kts sau khi xử lý (để debug nếu build vẫn lỗi) ---"
+          cat "$GRADLE_FILE"
+
+      # R8 "full mode" (mặc định từ AGP 7+) phân tích NGHIÊM NGẶT TOÀN
+      # CHƯƠNG TRÌNH — đây là lý do "missing class" bị nâng thành LỖI CỨNG
+      # thay vì chỉ cảnh báo, khiến "-dontwarn" trong proguard-rules.pro
+      # (bước trên) không đủ để hoá giải khi thư viện bên thứ 3
+      # (google_mlkit_text_recognition) tự đóng gói không nhất quán giữa
+      # các module ngôn ngữ. Tắt full mode (quay về chế độ phân tích như R8
+      # "non-full mode"/ProGuard cũ) là cách xử lý CHÍNH THỨC được Google
+      # tài liệu hoá cho đúng nhóm lỗi này — vẫn giữ nguyên minify/obfuscate
+      # cho toàn bộ code còn lại của app, chỉ nới lỏng đúng phần kiểm tra gây
+      # lỗi cứng này.
+      - name: Tắt R8 full mode (fix lỗi Missing classes từ google_mlkit_text_recognition)
+        run: |
+          PROPS_FILE=android/gradle.properties
+          if [ -f "$PROPS_FILE" ] && ! grep -q "android.enableR8.fullMode" "$PROPS_FILE"; then
+            echo "android.enableR8.fullMode=false" >> "$PROPS_FILE"
+          fi
+          echo "--- android/gradle.properties sau khi xử lý ---"
+          cat "$PROPS_FILE"
+
+      # flutter create mặc định không bật quyền Internet — bắt buộc phải có
+      # để app gọi được API model. Tự thêm nếu chưa có, không cần người
+      # dùng sửa tay AndroidManifest.xml.
       - name: Tự thêm quyền INTERNET vào AndroidManifest
         run: |
           MANIFEST=android/app/src/main/AndroidManifest.xml
@@ -60,14 +214,141 @@ jobs:
             sed -i '/<manifest /a\    <uses-permission android:name="android.permission.INTERNET"/>' "$MANIFEST"
           fi
 
+      # Đổi tên hiển thị trên màn hình điện thoại thành "AgentAiChat" (mặc
+      # định flutter create đặt label = project name).
+      - name: Đổi tên hiển thị app thành AgentAiChat
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          sed -i 's/android:label="[^"]*"/android:label="AgentAiChat"/' "$MANIFEST"
+
+      # Copy trực tiếp các icon đã chuẩn bị sẵn (assets/icon/mipmap-*/) vào
+      # đúng thư mục res/ của Android — KHÔNG dùng package
+      # flutter_launcher_icons (đã gây lỗi Gradle do dependency `jni` của nó
+      # đụng độ với cách Flutter mới build Kotlin). Cách này không thêm bất
+      # kỳ dependency Dart/Gradle nào, chỉ là copy file, nên không thể vỡ
+      # theo kiểu tương tự.
+      - name: Cài icon app (copy file, không dùng package ngoài)
+        run: |
+          rm -rf android/app/src/main/res/mipmap-anydpi-v26
+          for dpi in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            mkdir -p "android/app/src/main/res/mipmap-$dpi"
+            cp "assets/icon/mipmap-$dpi/ic_launcher.png" "android/app/src/main/res/mipmap-$dpi/ic_launcher.png"
+          done
+
       - name: Get dependencies
         run: flutter pub get
 
+      # Đã thử 3 cách "ẩn cảnh báo" (dontwarn, sửa neo sed, tắt R8 full mode)
+      # nhưng lỗi "Missing class" vẫn y hệt qua nhiều lần build — nghĩa là
+      # các class đó THẬT SỰ không có trong classpath, không phải R8 xử lý
+      # sai. Cách xử lý tận gốc: khai báo THẲNG dependency Android gốc cho 4
+      # module ngôn ngữ mà google_mlkit_text_recognition cần nhưng không tự
+      # kéo về đủ. Không cần trùng version với bất kỳ đâu — nếu có xung đột
+      # version với chính plugin, Gradle tự chọn bản cao nhất (khác hẳn
+      # Dart pub, Gradle không tự fail vì việc này).
+      - name: Thêm thẳng dependency ML Kit ngôn ngữ (fix tận gốc Missing class)
+        run: |
+          GRADLE_FILE=android/app/build.gradle.kts
+          if [ -f "$GRADLE_FILE" ] && ! grep -q "text-recognition-chinese" "$GRADLE_FILE"; then
+            if grep -qE 'dependencies[[:space:]]*\{' "$GRADLE_FILE"; then
+              echo "Tìm thấy block dependencies { — chèn vào ngay sau bằng awk"
+              awk '
+                /dependencies[ \t]*\{/ && !done {
+                  print
+                  print "    implementation(\"com.google.mlkit:text-recognition-chinese:16.0.1\")"
+                  print "    implementation(\"com.google.mlkit:text-recognition-japanese:16.0.1\")"
+                  print "    implementation(\"com.google.mlkit:text-recognition-korean:16.0.1\")"
+                  print "    implementation(\"com.google.mlkit:text-recognition-devanagari:16.0.1\")"
+                  done = 1
+                  next
+                }
+                { print }
+              ' "$GRADLE_FILE" > "$GRADLE_FILE.tmp"
+              mv "$GRADLE_FILE.tmp" "$GRADLE_FILE"
+            else
+              echo "Không thấy block dependencies { có sẵn — tự thêm mới vào cuối file"
+              {
+                echo ''
+                echo 'dependencies {'
+                echo '    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")'
+                echo '    implementation("com.google.mlkit:text-recognition-japanese:16.0.1")'
+                echo '    implementation("com.google.mlkit:text-recognition-korean:16.0.1")'
+                echo '    implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")'
+                echo '}'
+              } >> "$GRADLE_FILE"
+            fi
+          fi
+          echo "--- android/app/build.gradle.kts (đoạn dependencies) ---"
+          grep -n -A 6 "dependencies {" "$GRADLE_FILE" || true
+
+      # Một số plugin Android cũ (ví dụ webview_cookie_manager) được viết từ
+      # trước khi Android Gradle Plugin 8+ BẮT BUỘC phải khai báo `namespace`
+      # trong build.gradle — nếu thiếu, Gradle báo lỗi "Namespace not
+      # specified". Đây là lỗi rất phổ biến với plugin lâu không cập nhật,
+      # không phải lỗi ở code của app. Cách vá chuẩn (theo hướng dẫn chính
+      # thức của Google, xem link trong thông báo lỗi): lấy package name từ
+      # chính AndroidManifest.xml cũ của plugin đó, khai báo lại thành
+      # `namespace` trong build.gradle của nó. Áp dụng tự động cho MỌI plugin
+      # gặp lỗi này (không hardcode riêng 1 tên), để lần sau thêm plugin khác
+      # bị lỗi tương tự cũng tự vá được, không cần sửa workflow nữa.
+      - name: Vá namespace cho plugin Android cũ chưa khai báo (lỗi AGP 8+)
+        run: |
+          PUB_CACHE_DIR="${PUB_CACHE:-$HOME/.pub-cache}"
+          echo "Dò plugin Android thiếu namespace trong $PUB_CACHE_DIR ..."
+          find "$PUB_CACHE_DIR/hosted" -maxdepth 3 -type d -name android 2>/dev/null | while read -r ANDROID_DIR; do
+            MANIFEST_FILE="$ANDROID_DIR/src/main/AndroidManifest.xml"
+            [ -f "$MANIFEST_FILE" ] || continue
+            PKG=$(grep -o 'package="[^"]*"' "$MANIFEST_FILE" | head -n1 | sed 's/package="//;s/"//')
+            [ -n "$PKG" ] || continue
+            for GRADLE_FILE in "$ANDROID_DIR/build.gradle" "$ANDROID_DIR/build.gradle.kts"; do
+              [ -f "$GRADLE_FILE" ] || continue
+              grep -q "namespace" "$GRADLE_FILE" && continue
+              echo "Vá namespace=\"$PKG\" cho $GRADLE_FILE"
+              if [[ "$GRADLE_FILE" == *.kts ]]; then
+                sed -i "0,/android[[:space:]]*{/s//android {\n    namespace = \"$PKG\"/" "$GRADLE_FILE"
+              else
+                sed -i "0,/android[[:space:]]*{/s//android {\n    namespace \"$PKG\"/" "$GRADLE_FILE"
+              fi
+            done
+          done
+
       - name: Build APK (release)
-        run: flutter build apk --release
+        run: |
+          echo "=================================================================="
+          echo "XÁC NHẬN CÁC BƯỚC VÁ TRƯỚC ĐÓ CÓ THỰC SỰ CHẠY HAY KHÔNG (mã đánh dấu: FIX-v28)"
+          echo "=================================================================="
+          echo "--- proguard-rules.pro có tồn tại và có nội dung dontwarn không? ---"
+          if [ -f android/app/proguard-rules.pro ]; then
+            cat android/app/proguard-rules.pro
+          else
+            echo "!!! KHÔNG TỒN TẠI android/app/proguard-rules.pro !!!"
+          fi
+          echo "--- build.gradle.kts có dòng proguardFiles không? ---"
+          grep -n "proguardFiles" android/app/build.gradle.kts || echo "!!! KHÔNG có dòng proguardFiles !!!"
+          echo "--- build.gradle.kts có dependency ML Kit ngôn ngữ không? ---"
+          grep -n "text-recognition-chinese\|text-recognition-japanese\|text-recognition-korean\|text-recognition-devanagari" android/app/build.gradle.kts || echo "!!! KHÔNG có dependency ML Kit ngôn ngữ !!!"
+          echo "--- gradle.properties có tắt R8 full mode không? ---"
+          grep -n "enableR8.fullMode" android/gradle.properties || echo "!!! KHÔNG có dòng tắt R8 full mode !!!"
+          echo "=================================================================="
+          echo "KẾT THÚC XÁC NHẬN — bắt đầu build thật"
+          echo "=================================================================="
+          flutter build apk --release
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
+
+      # Nếu build fail ở bước R8 (như đã gặp nhiều lần), Google tự sinh ra
+      # 1 file ghi CHÍNH XÁC cần thêm rule gì để sửa (missing_rules.txt) —
+      # nhưng file đó chỉ tồn tại trong máy chạy CI, mất luôn khi job kết
+      # thúc, nên trước giờ không đọc được. Luôn lưu lại (kể cả khi các bước
+      # trước đó fail) để có thể tải về đọc chính xác, thay vì phải đoán.
+      - name: Luôn lưu lại missing_rules.txt nếu R8 có sinh ra (kể cả khi build fail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r8-missing-rules
+          path: build/app/outputs/mapping/release/
+          if-no-files-found: ignore
